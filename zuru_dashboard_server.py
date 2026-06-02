@@ -109,7 +109,8 @@ def fetch_data():
             DashboardPeOperador,
             DashboardPePrimaOperador,
             DashboardPeFechaEmision,
-            DashboardPeProducto
+            DashboardPeProducto,
+            DashboardPeProducer
         FROM DashboardPe
         WHERE DashboardPeOperador IS NOT NULL
           AND DashboardPeOperador != ''
@@ -257,6 +258,7 @@ if os.path.exists(_original_script):
     _orig_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(_orig_module)
     generate_html = _orig_module.generate_html
+    process_data = _orig_module.process_data
 else:
     print("=" * 60)
     print("ERROR: No se encontró zuru_dashboard.py en la misma carpeta.")
@@ -275,8 +277,8 @@ def dashboard():
     """Genera el dashboard con datos frescos de la base de datos."""
     try:
         rows = fetch_data()
-        data, products = process_data(rows)
-        html = generate_html(data, products)
+        data, products, producers, raw_rows = process_data(rows)
+        html = generate_html(data, products, producers, raw_rows)
 
         # Inject auto-refresh meta tag into the HTML <head>
         refresh_meta = f'<meta http-equiv="refresh" content="{AUTO_REFRESH_SECONDS}">'

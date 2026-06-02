@@ -92,7 +92,8 @@ def fetch_data():
             DashboardPeOperador,
             DashboardPePrimaOperador,
             DashboardPeFechaEmision,
-            DashboardPeProducto
+            DashboardPeProducto,
+            DashboardPeProducer
         FROM DashboardPe
         WHERE DashboardPeOperador IS NOT NULL
           AND DashboardPeOperador != ''
@@ -110,6 +111,8 @@ def fetch_data():
 def process_data(rows):
     operators = {}
     products_set = set()
+    producers_set = set()
+    raw_rows = []  # Clean rows for client-side date filtering
 
     # Determine the max month in 2026 data to use as cutoff for same-period comparison
     max_month_2026 = 0
@@ -137,9 +140,12 @@ def process_data(rows):
         prima = float(row["DashboardPePrimaOperador"] or 0)
         fecha = row["DashboardPeFechaEmision"]
         producto = (row.get("DashboardPeProducto") or "Sin Producto").strip()
+        producer = (row.get("DashboardPeProducer") or "Sin Producer").strip()
 
         if producto:
             products_set.add(producto)
+        if producer and producer != "Sin Producer":
+            producers_set.add(producer)
 
         if isinstance(fecha, str):
             try:
@@ -155,8 +161,19 @@ def process_data(rows):
         if year not in (2025, 2026):
             continue
 
+        # Save clean row for client-side re-aggregation (compact format)
+        raw_rows.append([
+            name,
+            round(prima, 2),
+            year,
+            month,
+            producto,
+            producer,
+        ])
+
         if name not in operators:
-            operators[name] = {"name": name, "prima_2025": 0, "prima_2025_total": 0, "prima_2026": 0, "products": {}}
+            operators[name] = {"name": name, "prima_2025": 0, "prima_2025_total": 0, "prima_2026": 0, "products": {}, "producers": set()}
+        operators[name]["producers"].add(producer)
         if producto not in operators[name]["products"]:
             operators[name]["products"][producto] = {"prima_2025": 0, "prima_2025_total": 0, "prima_2026": 0}
 
@@ -224,19 +241,24 @@ def process_data(rows):
             "meets_growth": meets_growth,
             "qualified": eligible and meets_growth,
             "products": prod_list,
+            "producers": sorted(data["producers"]),
         })
 
-    results.sort(key=lambda x: x["score_final"], reverse=True)
+    results.sort(key=lambda x: x["name"].lower())
 
     for i, r in enumerate(results):
         r["rank"] = i + 1
 
-    return results, sorted(products_set)
+    return results, sorted(products_set), sorted(producers_set), raw_rows
 
 
-def generate_html(data, products=None):
+def generate_html(data, products=None, producers=None, raw_rows=None):
     if products is None:
         products = []
+    if producers is None:
+        producers = []
+    if raw_rows is None:
+        raw_rows = []
     total_operators = len(data)
     qualified = [d for d in data if d["qualified"]]
     total_prima_2026 = sum(d["prima_2026"] for d in data)
@@ -246,6 +268,8 @@ def generate_html(data, products=None):
 
     data_json = json.dumps(data, ensure_ascii=False)
     products_json = json.dumps(products, ensure_ascii=False)
+    producers_json = json.dumps(producers, ensure_ascii=False)
+    raw_json = json.dumps(raw_rows, ensure_ascii=False)
     generation_date = datetime.now().strftime("%d/%m/%Y %H:%M")
 
     html = f"""<!DOCTYPE html>
@@ -654,10 +678,18 @@ tbody tr:last-child td {{ border-bottom: none; }}
     <select id="operatorFilter" onchange="filterData()">
       <option value="__ALL__">Todos los operadores</option>
     </select>
+    <label>Producer:</label>
+    <select id="producerFilter" onchange="filterData()">
+      <option value="__ALL__">Todos los producers</option>
+    </select>
     <label>Producto:</label>
     <select id="productFilter" onchange="filterData()">
       <option value="__ALL__">Todos los productos</option>
     </select>
+    <label>Desde:</label>
+    <input type="date" id="dateFrom" onchange="filterData()">
+    <label>Hasta:</label>
+    <input type="date" id="dateTo" onchange="filterData()">
     <label>Buscar:</label>
     <input type="text" id="searchInput" placeholder="Buscar operador..." oninput="searchOperator()">
     <button class="btn btn-outline" onclick="resetFilters()">Limpiar filtros</button>
@@ -799,15 +831,119 @@ tbody tr:last-child td {{ border-bottom: none; }}
 </div>
 
 <script>
-const ALL_DATA = {data_json};
+const ALL_DATA_ORIGINAL = {data_json};
+let ALL_DATA = JSON.parse(JSON.stringify(ALL_DATA_ORIGINAL));
 const ALL_PRODUCTS = {products_json};
+const ALL_PRODUCERS = {producers_json};
+const ALL_RAW = {raw_json};
 let filteredData = [...ALL_DATA];
 let activeProductFilter = '__ALL__';
+let activeProducerFilter = '__ALL__';
+let activeDateFrom = '';
+let activeDateTo = '';
 
 const PRIMA_RANGES = [[40000, 100],[30000, 90],[20000, 80],[15000, 70],[10000, 60]];
 const GROWTH_RANGES = [[0.60, 100],[0.50, 95],[0.40, 90],[0.30, 80],[0.25, 70],[0.20, 60],[0.15, 50],[0.10, 40]];
 const THRESHOLDS = {{'Chubb - Int.': 10000, 'Lampe - Carga': 20000}};
 const DEFAULT_THRESHOLD = 10000;
+
+/* Re-aggregate ALL_DATA from raw rows applying date filters.
+   ALL_RAW format: [name, prima, year, month, producto, producer] */
+function rebuildFromRaw(dateFrom, dateTo) {{
+  // If no date filter, restore original
+  if (!dateFrom && !dateTo) {{
+    ALL_DATA = JSON.parse(JSON.stringify(ALL_DATA_ORIGINAL));
+    return;
+  }}
+
+  // Parse date filters to year/month for comparison
+  const dfY = dateFrom ? parseInt(dateFrom.substring(0,4)) : 0;
+  const dfM = dateFrom ? parseInt(dateFrom.substring(5,7)) : 0;
+  const dtY = dateTo ? parseInt(dateTo.substring(0,4)) : 9999;
+  const dtM = dateTo ? parseInt(dateTo.substring(5,7)) : 12;
+
+  const rows = ALL_RAW.filter(r => {{
+    const ym = r[2] * 100 + r[3]; // e.g. 202601
+    const fym = dfY * 100 + dfM;
+    const tym = dtY * 100 + dtM;
+    if (dateFrom && ym < fym) return false;
+    if (dateTo && ym > tym) return false;
+    return true;
+  }});
+
+  // Detect max month in 2026 for same-period comparison (within filtered rows)
+  let maxMonth2026 = 0;
+  rows.forEach(r => {{
+    if (r[2] === 2026 && r[3] > maxMonth2026) maxMonth2026 = r[3];
+  }});
+  if (maxMonth2026 === 0) maxMonth2026 = 12;
+
+  // Aggregate by operator
+  const ops = {{}};
+  rows.forEach(r => {{
+    const name = r[0], prima = r[1], y = r[2], m = r[3], prod = r[4], producer = r[5];
+    if (y !== 2025 && y !== 2026) return;
+
+    if (!ops[name]) ops[name] = {{ name: name, prima_2025: 0, prima_2025_total: 0, prima_2026: 0, products: {{}}, producers: new Set() }};
+    const op = ops[name];
+    if (producer) op.producers.add(producer);
+    if (!op.products[prod]) op.products[prod] = {{ prima_2025: 0, prima_2025_total: 0, prima_2026: 0 }};
+    const pr = op.products[prod];
+
+    if (y === 2025) {{
+      op.prima_2025_total += prima;
+      pr.prima_2025_total += prima;
+      if (m <= maxMonth2026) {{
+        op.prima_2025 += prima;
+        pr.prima_2025 += prima;
+      }}
+    }} else {{
+      op.prima_2026 += prima;
+      pr.prima_2026 += prima;
+    }}
+  }});
+
+  // Build results array
+  const results = [];
+  for (const [name, data] of Object.entries(ops)) {{
+    const p25 = Math.round(data.prima_2025 * 100) / 100;
+    const p25t = Math.round(data.prima_2025_total * 100) / 100;
+    const p26 = Math.round(data.prima_2026 * 100) / 100;
+    const growth = p25 > 0 ? Math.round((p26 - p25) / p25 * 10000) / 10000 : null;
+    const s1 = calcScore1(p26);
+    const s2 = calcScore2(growth);
+    const sf = Math.round((s1 * 0.6 + s2 * 0.4) * 10) / 10;
+
+    let eligible = false;
+    const prodList = [];
+    for (const [pname, pdata] of Object.entries(data.products)) {{
+      const threshold = THRESHOLDS[pname] || DEFAULT_THRESHOLD;
+      if (pdata.prima_2026 >= threshold) eligible = true;
+      prodList.push({{
+        producto: pname,
+        prima_2025: Math.round(pdata.prima_2025 * 100) / 100,
+        prima_2025_total: Math.round(pdata.prima_2025_total * 100) / 100,
+        prima_2026: Math.round(pdata.prima_2026 * 100) / 100,
+        threshold: threshold,
+      }});
+    }}
+    prodList.sort((a, b) => b.prima_2026 - a.prima_2026);
+
+    const meetsGrowth = growth !== null && growth >= 0.10;
+    results.push({{
+      name, prima_2025: p25, prima_2025_total: p25t, prima_2026: p26,
+      growth, growth_pct: growth !== null ? Math.round(growth * 1000) / 10 : null,
+      score1: s1, score2: s2, score_final: sf,
+      eligible_program: eligible, meets_growth: meetsGrowth,
+      qualified: eligible && meetsGrowth, products: prodList,
+      producers: [...data.producers],
+    }});
+  }}
+
+  results.sort((a, b) => a.name.localeCompare(b.name));
+  results.forEach((d, i) => {{ d.rank = i + 1; }});
+  ALL_DATA = results;
+}}
 
 function getThreshold(prodName) {{
   return THRESHOLDS[prodName] || DEFAULT_THRESHOLD;
@@ -871,7 +1007,7 @@ function recalcForProduct(data, prodVal) {{
 }}
 
 function rerank(data) {{
-  data.sort((a, b) => b.score_final - a.score_final);
+  data.sort((a, b) => a.name.localeCompare(b.name));
   data.forEach((d, i) => {{ d.rank = i + 1; }});
   return data;
 }}
@@ -893,11 +1029,19 @@ function getUrlParam(name) {{
 
 function init() {{
   const sel = document.getElementById('operatorFilter');
-  ALL_DATA.forEach(d => {{
+  const sortedOps = [...ALL_DATA].sort((a, b) => a.name.localeCompare(b.name));
+  sortedOps.forEach(d => {{
     const opt = document.createElement('option');
     opt.value = d.name;
     opt.textContent = d.name;
     sel.appendChild(opt);
+  }});
+  const prsel = document.getElementById('producerFilter');
+  ALL_PRODUCERS.forEach(p => {{
+    const opt = document.createElement('option');
+    opt.value = p;
+    opt.textContent = p;
+    prsel.appendChild(opt);
   }});
   const psel = document.getElementById('productFilter');
   ALL_PRODUCTS.forEach(p => {{
@@ -928,9 +1072,24 @@ function init() {{
 function filterData() {{
   const opVal = document.getElementById('operatorFilter').value;
   const prodVal = document.getElementById('productFilter').value;
+  const producerVal = document.getElementById('producerFilter').value;
+  const dateFrom = document.getElementById('dateFrom').value;
+  const dateTo = document.getElementById('dateTo').value;
   activeProductFilter = prodVal;
+  activeProducerFilter = producerVal;
+  activeDateFrom = dateFrom;
+  activeDateTo = dateTo;
+
+  // Re-aggregate from raw if dates changed
+  rebuildFromRaw(dateFrom, dateTo);
 
   let data = recalcForProduct([...ALL_DATA], prodVal);
+
+  // Filter by producer
+  if (producerVal !== '__ALL__') {{
+    data = data.filter(d => d.producers && d.producers.includes(producerVal));
+  }}
+
   data = rerank(data);
 
   if (opVal !== '__ALL__') {{
@@ -948,7 +1107,14 @@ function filterData() {{
 function searchOperator() {{
   const q = document.getElementById('searchInput').value.toLowerCase();
   activeProductFilter = document.getElementById('productFilter').value;
+  activeProducerFilter = document.getElementById('producerFilter').value;
+  const dateFrom = document.getElementById('dateFrom').value;
+  const dateTo = document.getElementById('dateTo').value;
+  rebuildFromRaw(dateFrom, dateTo);
   let data = recalcForProduct([...ALL_DATA], activeProductFilter);
+  if (activeProducerFilter !== '__ALL__') {{
+    data = data.filter(d => d.producers && d.producers.includes(activeProducerFilter));
+  }}
   data = rerank(data);
   if (q) {{ data = data.filter(d => d.name.toLowerCase().includes(q)); }}
   filteredData = data;
@@ -958,9 +1124,16 @@ function searchOperator() {{
 
 function resetFilters() {{
   document.getElementById('operatorFilter').value = '__ALL__';
+  document.getElementById('producerFilter').value = '__ALL__';
   document.getElementById('productFilter').value = '__ALL__';
+  document.getElementById('dateFrom').value = '';
+  document.getElementById('dateTo').value = '';
   document.getElementById('searchInput').value = '';
   activeProductFilter = '__ALL__';
+  activeProducerFilter = '__ALL__';
+  activeDateFrom = '';
+  activeDateTo = '';
+  rebuildFromRaw('', '');
   filteredData = rerank([...ALL_DATA]);
   document.getElementById('operatorDetail').classList.remove('active');
   renderAll();
@@ -1121,9 +1294,10 @@ function selectOperator(name) {{
 }}
 
 function exportCSV() {{
-  let csv = 'Rank,Operador,Prima 2025 Total,Prima 2025 Periodo,Prima 2026,Crecimiento %,Score 1,Score 2,Score Final,Calificado\\n';
+  let csv = 'Rank,Operador,Producer,Prima 2025 Total,Prima 2025 Periodo,Prima 2026,Crecimiento %,Score 1,Score 2,Score Final,Calificado\\n';
   filteredData.forEach(d => {{
-    csv += d.rank + ',"' + d.name + '",' + d.prima_2025_total + ',' + d.prima_2025 + ',' + d.prima_2026 + ',' +
+    const prods = d.producers ? d.producers.join('; ') : '';
+    csv += d.rank + ',"' + d.name + '","' + prods + '",' + d.prima_2025_total + ',' + d.prima_2025 + ',' + d.prima_2026 + ',' +
       (d.growth_pct != null ? d.growth_pct : '') + ',' + d.score1 + ',' + d.score2 + ',' +
       d.score_final + ',' + (d.qualified ? 'Si' : 'No') + '\\n';
   }});
@@ -1155,15 +1329,16 @@ def main():
     print()
 
     rows = fetch_data()
-    data, products = process_data(rows)
+    data, products, producers, raw_rows = process_data(rows)
 
     print(f"Se procesaron {len(data)} operadores.")
     print(f"Productos encontrados: {len(products)}")
+    print(f"Producers encontrados: {len(producers)}")
     qualified = [d for d in data if d["qualified"]]
     print(f"Operadores calificados: {len(qualified)}")
     print()
 
-    html = generate_html(data, products)
+    html = generate_html(data, products, producers, raw_rows)
 
     output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zuru_dashboard.html")
     with open(output_path, "w", encoding="utf-8") as f:
